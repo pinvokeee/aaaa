@@ -1,228 +1,282 @@
+const MAX_CONSECUTIVE_DAYS = 6;
+const WEEKDAY_BOOTH = 17;
+const WEEKEND_BOOTH = Math.round(WEEKDAY_BOOTH / 3.83);
+
+const INSUFFICIENT_R = 0.90;
+
+const WEEKDAY_TYPE_TEXT = "A";
+const WEEKEND_TYPE_TEXT = "B";
+
+const WORK_STATE = "出勤";
+const OFFDAY_PAID = "有休";
+const OFFDAY_REQ = "希望休";
+const OFFDAY_HALF_MOON = "午前休";
+const OFFDAY_HALF_AFTER = "午後休";
+
 const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
 
-const weekdayBooth = 15;
-const weekendBooth = 6;
+const holidays = spreadsheet.getSheetByName("祝日").getDataRange().getValues().map(row => new Date(row[0]).getTime());
 
-const toYYYYMD = (date) => {
-  return `${date.getFullYear()}/${date.getMonth()+1}/${date.getDate()}`;
+const isWeekend = (date) => {
+  const day = date.getDay();
+  return day === 0 || day === 6 || holidays.includes(date.getTime());
 }
 
-//土日祝か
-const isWeekEnd = (d) => {
-  const dayOfWeek = new Date(d).getDay();
+const getOffDay = (date, dayOff) => {
 
-  //一旦土日だけ判定
-  return dayOfWeek == 0 || dayOfWeek == 6;
+  const fixed = dayOff.fixed.includes(date.getDay());
+  const day = dayOff.dates.find(d => d.dateTime == date.getTime());
+  const isOffDay = day && (day.type != OFFDAY_HALF_AFTER && day.type != OFFDAY_HALF_MOON);
+  const isHalfOff = day && (day.type == OFFDAY_HALF_AFTER || day.type == OFFDAY_HALF_MOON);
+
+  return {
+    fixed,
+    day,
+    isHalfOff,
+    isOff: fixed || isOffDay,
+  };
 }
 
-//平日出社可能か
-const isAssignWeekDay = (e) => {
-  return e.shiftType == "A" || e.shiftType == "B";
+const formatDate = (date) => {
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), "yyyy/MM/dd");
 }
 
-//土日祝出社可能か
-const isAssignWeekEnd = (e) => {
-  return e.shiftType == "B";
+const isInsufficient = (day) => {
+  const boothCount = isWeekend(day.date) ? WEEKEND_BOOTH : WEEKDAY_BOOTH;
+  const count = day.assigned.length;
+  const minimumBooth = boothCount * INSUFFICIENT_R;
+  return minimumBooth > count;
 }
 
-//シートから従業員情報リストを作成
 const getEmployeeList = () => {
 
-  const range = spreadsheet.getSheetByName("マスタ").getDataRange().getValues();
+  const sheet = spreadsheet.getSheetByName("マスタ");
+  const offDaysSheet = spreadsheet.getSheetByName("休み");
+  const offDaysTable = offDaysSheet.getDataRange().getValues();
 
-  //ヘッダーはいらないのでポイする
-  range.shift();
+  offDaysTable.shift(); //ヘッダーを削除
 
-  return range.map(([id, name, role, shiftType]) => ({id, name, role, shiftType}));
+  const offDaysEmployeeDic = {};
+  
+  offDaysTable.forEach(([id, name, date, type]) => {
+    if (!offDaysEmployeeDic[id]) offDaysEmployeeDic[id] = [];
+    offDaysEmployeeDic[id].push( { dateTime: new Date(date).getTime(), type });
+  });
+
+  const data = sheet.getDataRange().getValues();
+  data.shift(); // remove header
+
+  const weekTexts = ["日", "月", "火", "水", "木", "金", "土"];
+ 
+  return data.map(([id, name, role, shiftType, _fxh]) => ({
+    id,
+    name,
+    role,
+    shiftType,
+    dayOff: {
+      dates: offDaysEmployeeDic[id] ?? [],
+      fixed: _fxh.length > 0 ? _fxh.split(",").map(day => weekTexts.indexOf(day.trim())) : [],
+    },
+    assignedDates: []
+  }));
 }
 
-//指定期間のシフトカレンダーを作成する
-const createShiftCalendar = () => {
+const createCalendar = (start, end) => {
 
-  const beginDate = new Date("2025/3/29");
-  const endDate = new Date("2025/05/04");
-  const workCount = ((endDate.getTime() - beginDate.getTime()) / (60 * 60 * 24 * 1000)) + 1;
+  const dates = [];
+  const date = new Date(start);
 
-  const currentDate = new Date(beginDate);
+  while (date <= end) {
 
-  const calender = [];
+    dates.push({
+      date: new Date(date),
+      assigned: [],
+      offStates: {},
+    });
 
-  for (let i = 0; i < workCount; i++) {
-
-    calender.push({ date: toYYYYMD(currentDate), assigned: [] });
-    currentDate.setDate(currentDate.getDate() + 1);
+    date.setDate(date.getDate() + 1);
   }
 
-  return calender;
+  return dates;
 }
 
-//引数のシフトカレンダーに従業員を割り当てる
-const assignShift = (calendar, employees) => {
+const loadScheduledShifts = (calendar, employees) => {
 
-  const assignCount = employees.map((employee) => ({ employee, count: 0, lastAssign: 0 }));
+  const data = spreadsheet.getSheetByName("確定済みシフト").getDataRange().getValues();
+  data.shift();
 
-  //土日祝を先に割り当てる
-  assignShiftPart(calendar, employees, assignCount, true, false);
+  for (const row of data) {
 
-  //平日を割り当て
-  assignShiftPart(calendar, employees, assignCount, false, true);
+    const [dateText, id, name, state] = row;
+    const date = new Date(dateText);
+    const e = employees.find(_e => _e.id == id && _e.name == name);
+    const targetDate = calendar.find(_d => _d.date.getTime() == date.getTime());
 
-  //平日に土日祝可能メンバーを割り当て
-  assignShiftPart(calendar, employees, assignCount, false, false);
-
-  console.log(assignCount);
-}
-
-const assignShiftPart = (calendar, employees, assignCount, isAsssignToWeekEnd, isWeekDayMemberOnly) => {
-
-  for (let i = 0; i < calendar.length; i++) {
-
-    const targetDay = calendar[i];
-    const date = new Date(targetDay.date);
-
-    const amount = isWeekEnd(date) ? weekendBooth : weekdayBooth;
-
-    if (isWeekEnd(date) && isAsssignToWeekEnd) {
-
-      let reqEmployees = getAssignEmployees(calendar, i, employees, amount, assignCount);
-      targetDay.assigned.push(...reqEmployees);
-
-      //日曜日なら一旦割り当て少ない順にソート
-      if (date.getDay() == 0) {
-        assignCount.sort((a, b) => {
-          if (a.lastAssign == b.lastAssign) return a.count - b.count;
-          return a.lastAssign - b.lastAssign;
-        })
-      }
+    if (e && targetDate) {
+      if (state == WORK_STATE) targetDate.assigned.push(e);
+      
     }
-    else if (!isWeekEnd(date) && !isAsssignToWeekEnd) {
+  }
 
-      const targetEmployees = isWeekDayMemberOnly ? employees.filter(e => !isAssignWeekEnd(e)) : employees;
+}
 
-      //土日祝出社不可（平日のみ）に絞って渡す
-      let reqEmployees = getAssignEmployees(calendar, i, targetEmployees, amount, assignCount);
-      targetDay.assigned.push(...reqEmployees);
+const canAssign = (employee, targetDate, calendar) => {
 
-      if (!isWeekDayMemberOnly) {
-        //金曜日なら一旦割り当て少ない順にソート
-        if (date.getDay() == 5) {
-          assignCount.sort((a, b) => {
-            if (a.lastAssign == b.lastAssign) return a.count - b.count;
-            return a.lastAssign - b.lastAssign;
-          })
+  const targetTime = targetDate.getTime();
+
+  // 過去と未来の連続出勤日数をチェック
+  let consecutive = 0;
+
+  for (let offset = -MAX_CONSECUTIVE_DAYS + 1; offset < MAX_CONSECUTIVE_DAYS; offset++) {
+
+    if (offset === 0) continue;
+    
+    const checkDate = new Date(targetDate);
+    checkDate.setDate(checkDate.getDate() + offset);
+    
+    const checkStr = formatDate(checkDate);
+    
+    if (employee.assignedDates.includes(checkStr)) {
+      consecutive++;
+    } else {
+      consecutive = 0;
+    }
+
+    if (consecutive >= MAX_CONSECUTIVE_DAYS - 1) return false;
+  }
+
+  return true;
+}
+
+const assignShifts = (calendar, employees) => {
+
+  const offStates = {};
+
+  const registOffState = (emp, day, offday, states) => {
+    if (offday.day) {
+      const time = day.date.getTime();
+      if (!states[time]) states[time] = {};
+      states[time][emp.id] = offday;
+    }
+  }
+
+  for (const day of calendar) {
+
+    if (day.assigned.length > 0) continue;
+
+    const boothCount = isWeekend(day.date) ? WEEKEND_BOOTH : WEEKDAY_BOOTH;
+    const dateStr = formatDate(day.date);
+
+    // Aの人は平日にすべて出勤
+    const aTypeEmployees = employees.filter(e => e.shiftType === WEEKDAY_TYPE_TEXT);
+
+    if (!isWeekend(day.date)) {
+      for (const emp of aTypeEmployees) {
+
+        const offday = getOffDay(day.date, emp.dayOff);
+
+        if (!offday.isOff) {
+          day.assigned.push(emp);
+          emp.assignedDates.push(dateStr);
         }
-      }
 
+        registOffState(emp, day, offday, offStates);
+      }
     }
 
+    // Bの人だけを対象に空き枠を埋める
+    const alreadyAssignedIds = new Set(day.assigned.map(e => e.id));
+    const remainingSpots = boothCount - day.assigned.length;
+
+    if (remainingSpots > 0) {
+
+      const bTypeCandidates = employees.filter(e => {
+
+        const isAvailable = e.shiftType === WEEKEND_TYPE_TEXT;
+        const offday = getOffDay(day.date, e.dayOff);
+
+        registOffState(e, day, offday, offStates);
+
+        return isAvailable &&
+               !offday.isOff &&
+               !alreadyAssignedIds.has(e.id) &&
+               canAssign(e, day.date, calendar);
+      });
+
+      bTypeCandidates.sort((a, b) => a.assignedDates.length - b.assignedDates.length);
+
+      const selected = bTypeCandidates.slice(0, remainingSpots);
+      for (const emp of selected) {
+        day.assigned.push(emp);
+        emp.assignedDates.push(dateStr);
+      }
+    }
   }
 
+  for (const day of calendar) {
+
+    const isInsff = isInsufficient(day);
+
+
+
+  }
+  
+  //午前休・午後休・固定休・有休・希望休を書き出す
+  for (const day of calendar) {
+
+    for (const employee of employees) {
+      
+      const state = offStates[day.date.getTime()]?.[employee.id];
+
+      if (state) {
+        day.offStates[employee.id] = { employee, isHalf: state.isHalfOff, isFixed: state.fixed, text: state.fixed ? "固定休" : state.day.type };
+      }
+    }
+  }
 }
 
-const getAssignedFromRange = (employee, calender, index, pointer, count) => {
 
-    let on = 1, off = 0;
+const outputShift = (calendar) => {
 
-    //直近5日間を遡り出勤と休みの日をカウントする
-    for (let i = 0; i < count; i++) {
-      
-      let target = calender[index + (i * pointer) + pointer];
-      
-      if (!target) break;
+  const sheet = spreadsheet.getSheetByName("生成表");
+  sheet.clear();
 
-      if (target.assigned.find(e => e.id == employee.id)) {
-        on++;
+  const aaa = spreadsheet.getSheetByName("マスタ").getDataSourceTables();
+
+  const output = [["日付", "社員番号", "名前", "ステータス"]];
+  
+  for (const day of calendar) {
+
+    for (const emp of day.assigned) {
+
+      const state = day.offStates[emp.id];
+
+      if (!state?.isHalf) {
+        output.push([formatDate(day.date), emp.id, emp.name, WORK_STATE]);
       }
       else {
-        off++;
+        output.push([formatDate(day.date), emp.id, emp.name, state.text]);          
       }
     }
 
-    return {
-      on, off
+    for (const id of Object.keys(day.offStates)) {
+      const state = day.offStates[id];
+      output.push([formatDate(day.date), state.employee.id, state.employee.name, state.text ]);
     }
-}
-
-//カレンダーとインデックス、従業員リストと各従業員割当数から今回割り当てる従業員の情報を返す
-const getAssignEmployees = (calender, index, targetEmployees, count, assignCount) => {
-
-  const targetDay = calender[index];
-
-  const date = new Date(targetDay.date);
-  const weekend = isWeekEnd(date);
-
-  const es = [];
-
-  for (const e of assignCount) {
-
-    //必要数に達すればループ終了
-    if ((targetDay.assigned.length ?? 0) + es.length == count) {
-      if (date.getDate() == 1) {
-        console.log("aaa");
-      }
-      break;
-    }
-
-    const { employee } = e;
-
-    //現在割り当てされておらず、対象の従業員に含まれていれば
-    if ((!targetDay.assigned.find(te => te.id == employee.id)) && targetEmployees.find(te => te.id == employee.id)) {
-
-      if (weekend && isAssignWeekEnd(employee) || (!weekend && isAssignWeekDay(employee))) {
-
-        if (es.find(ef => ef.id == employee.id) == undefined) {
-
-          const prev = getAssignedFromRange(employee, calender, index, -1, 6);
-          const next = getAssignedFromRange(employee, calender, index, -1, 6);
-
-          //割り当て条件いずれか
-          //出勤5日、休みが2日ある
-          const isprevAssign = 
-          ((prev.on == 5 && prev.off == 2) ||
-          (prev.on < 5));
-
-          const isnextAssign = 
-          ((next.on == 5 && next.off == 2) ||
-          (next.on < 5));
-
-          if (date.getDate() == 12 && employee.name == "鈴木 花子") {
-            console.log("aaa")
-          }
-
-          if (isprevAssign && isnextAssign) {
-            es.push(employee);
-            e.count++;
-            e.lastAssign = date.getTime();
-          }
-        }
-      }
-    }
-
 
   }
 
-  return es;
+  sheet.getRange(1, 1, output.length, 4).setValues(output);
 }
 
 const run = () => {
-  
+
   const employees = getEmployeeList();
-  const calender = createShiftCalendar();
+  const calendar = createCalendar(new Date("2025/03/30"), new Date("2025/05/03"));
 
-  console.log(calender);
+  loadScheduledShifts(calendar, employees);
 
-  assignShift(calender, employees);
 
-  console.log(calender);
-
-  const data = calender.reduce((prev, current, index, arr) => {
-    prev.push(...current.assigned.map(e => [current.date, e.id, e.name, "出勤"]));
-
-    return prev;
-  }, []);
-
-  data.unshift(["日付", "社員番号", "名前", "ステータス"]);
-
-  spreadsheet.getSheetByName("生成表").getDataRange().clear();
-  spreadsheet.getSheetByName("生成表").getRange(1, 1, data.length, 4).setValues(data);
+  assignShifts(calendar, employees);
+  outputShift(calendar);
 }
