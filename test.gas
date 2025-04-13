@@ -113,8 +113,13 @@ const loadScheduledShifts = (calendar, employees) => {
     const targetDate = calendar.find(_d => _d.date.getTime() == date.getTime());
 
     if (e && targetDate) {
-      if (state == WORK_STATE) targetDate.assigned.push(e);
-      
+
+      const dateStr = formatDate(date);
+
+      if (state == WORK_STATE) {
+        targetDate.assigned.push(e);
+        e.assignedDates.push(dateStr);
+      }
     }
   }
 
